@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/trace"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/pocket-id/pocket-id/backend/internal/common"
 	"github.com/pocket-id/pocket-id/backend/internal/dto"
@@ -101,9 +102,10 @@ func (s *UserService) GetProfilePicture(ctx context.Context, userID string) (io.
 	profilePicturePath := path.Join("profile-pictures", userID+".png")
 
 	// Try custom profile picture
-	if file, size, err := s.fileStorage.Open(ctx, profilePicturePath); err == nil {
+	file, size, err := s.fileStorage.Open(ctx, profilePicturePath)
+	if err == nil {
 		return file, size, nil
-	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, 0, err
 	}
 
@@ -120,9 +122,10 @@ func (s *UserService) GetProfilePicture(ctx context.Context, userID string) (io.
 
 	// Try cached default for initials
 	defaultPicturePath := path.Join("profile-pictures", "defaults", user.Initials()+".png")
-	if file, size, err := s.fileStorage.Open(ctx, defaultPicturePath); err == nil {
+	file, size, err = s.fileStorage.Open(ctx, defaultPicturePath)
+	if err == nil {
 		return file, size, nil
-	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, 0, err
 	}
 
@@ -133,12 +136,13 @@ func (s *UserService) GetProfilePicture(ctx context.Context, userID string) (io.
 	}
 
 	// Save the default picture for future use (in a goroutine to avoid blocking)
-	//nolint:contextcheck
 	defaultPictureBytes := defaultPicture.Bytes()
 	//nolint:contextcheck
 	go func() {
-		if err := s.fileStorage.Save(context.Background(), defaultPicturePath, bytes.NewReader(defaultPictureBytes)); err != nil {
-			slog.Error("Failed to cache default profile picture", slog.String("initials", user.Initials()), slog.Any("error", err))
+		// Use bytes.NewReader because we need an io.ReadSeeker
+		rErr := s.fileStorage.Save(context.Background(), defaultPicturePath, bytes.NewReader(defaultPictureBytes))
+		if rErr != nil {
+			slog.Error("Failed to cache default profile picture", slog.String("initials", user.Initials()), slog.Any("error", rErr))
 		}
 	}()
 
@@ -182,17 +186,30 @@ func (s *UserService) UpdateProfilePicture(ctx context.Context, userID string, f
 }
 
 func (s *UserService) DeleteUser(ctx context.Context, userID string, allowLdapDelete bool) error {
-	return s.db.Transaction(func(tx *gorm.DB) error {
-		return s.deleteUserInternal(ctx, userID, allowLdapDelete, tx)
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		return s.deleteUserInternal(ctx, tx, userID, allowLdapDelete)
 	})
+	if err != nil {
+		return fmt.Errorf("failed to delete user '%s': %w", userID, err)
+	}
+
+	// Storage operations must be executed outside of a transaction
+	profilePicturePath := path.Join("profile-pictures", userID+".png")
+	err = s.fileStorage.Delete(ctx, profilePicturePath)
+	if err != nil && !storage.IsNotExist(err) {
+		return fmt.Errorf("failed to delete profile picture for user '%s': %w", userID, err)
+	}
+
+	return nil
 }
 
-func (s *UserService) deleteUserInternal(ctx context.Context, userID string, allowLdapDelete bool, tx *gorm.DB) error {
+func (s *UserService) deleteUserInternal(ctx context.Context, tx *gorm.DB, userID string, allowLdapDelete bool) error {
 	var user model.User
 
 	err := tx.
 		WithContext(ctx).
 		Where("id = ?", userID).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
 		First(&user).
 		Error
 	if err != nil {
@@ -202,11 +219,6 @@ func (s *UserService) deleteUserInternal(ctx context.Context, userID string, all
 	// Disallow deleting the user if it is an LDAP user, LDAP is enabled, and the user is not disabled
 	if !allowLdapDelete && !user.Disabled && user.LdapID != nil && s.appConfigService.GetDbConfig().LdapEnabled.IsTrue() {
 		return &common.LdapUserUpdateError{}
-	}
-
-	profilePicturePath := path.Join("profile-pictures", userID+".png")
-	if err := s.fileStorage.Delete(ctx, profilePicturePath); err != nil {
-		return err
 	}
 
 	err = tx.WithContext(ctx).Delete(&user).Error
@@ -241,6 +253,18 @@ func (s *UserService) createUserInternal(ctx context.Context, input dto.UserCrea
 		return model.User{}, &common.UserEmailNotSetError{}
 	}
 
+	var userGroups []model.UserGroup
+	if len(input.UserGroupIds) > 0 {
+		err := tx.
+			WithContext(ctx).
+			Where("id IN ?", input.UserGroupIds).
+			Find(&userGroups).
+			Error
+		if err != nil {
+			return model.User{}, err
+		}
+	}
+
 	user := model.User{
 		FirstName:   input.FirstName,
 		LastName:    input.LastName,
@@ -250,6 +274,7 @@ func (s *UserService) createUserInternal(ctx context.Context, input dto.UserCrea
 		IsAdmin:     input.IsAdmin,
 		Locale:      input.Locale,
 		Disabled:    input.Disabled,
+		UserGroups:  userGroups,
 	}
 	if input.LdapID != "" {
 		user.LdapID = &input.LdapID
@@ -273,7 +298,13 @@ func (s *UserService) createUserInternal(ctx context.Context, input dto.UserCrea
 
 	// Apply default groups and claims for new non-LDAP users
 	if !isLdapSync {
-		if err := s.applySignupDefaults(ctx, &user, tx); err != nil {
+		if len(input.UserGroupIds) == 0 {
+			if err := s.applyDefaultGroups(ctx, &user, tx); err != nil {
+				return model.User{}, err
+			}
+		}
+
+		if err := s.applyDefaultCustomClaims(ctx, &user, tx); err != nil {
 			return model.User{}, err
 		}
 	}
@@ -281,34 +312,51 @@ func (s *UserService) createUserInternal(ctx context.Context, input dto.UserCrea
 	return user, nil
 }
 
-func (s *UserService) applySignupDefaults(ctx context.Context, user *model.User, tx *gorm.DB) error {
+func (s *UserService) applyDefaultGroups(ctx context.Context, user *model.User, tx *gorm.DB) error {
 	config := s.appConfigService.GetDbConfig()
 
-	// Apply default user groups
 	var groupIDs []string
-	if v := config.SignupDefaultUserGroupIDs.Value; v != "" && v != "[]" {
-		if err := json.Unmarshal([]byte(v), &groupIDs); err != nil {
+	v := config.SignupDefaultUserGroupIDs.Value
+	if v != "" && v != "[]" {
+		err := json.Unmarshal([]byte(v), &groupIDs)
+		if err != nil {
 			return fmt.Errorf("invalid SignupDefaultUserGroupIDs JSON: %w", err)
 		}
 		if len(groupIDs) > 0 {
 			var groups []model.UserGroup
-			if err := tx.WithContext(ctx).Where("id IN ?", groupIDs).Find(&groups).Error; err != nil {
+			err = tx.WithContext(ctx).
+				Where("id IN ?", groupIDs).
+				Find(&groups).
+				Error
+			if err != nil {
 				return fmt.Errorf("failed to find default user groups: %w", err)
 			}
-			if err := tx.WithContext(ctx).Model(user).Association("UserGroups").Replace(groups); err != nil {
+
+			err = tx.WithContext(ctx).
+				Model(user).
+				Association("UserGroups").
+				Replace(groups)
+			if err != nil {
 				return fmt.Errorf("failed to associate default user groups: %w", err)
 			}
 		}
 	}
+	return nil
+}
 
-	// Apply default custom claims
+func (s *UserService) applyDefaultCustomClaims(ctx context.Context, user *model.User, tx *gorm.DB) error {
+	config := s.appConfigService.GetDbConfig()
+
 	var claims []dto.CustomClaimCreateDto
-	if v := config.SignupDefaultCustomClaims.Value; v != "" && v != "[]" {
-		if err := json.Unmarshal([]byte(v), &claims); err != nil {
+	v := config.SignupDefaultCustomClaims.Value
+	if v != "" && v != "[]" {
+		err := json.Unmarshal([]byte(v), &claims)
+		if err != nil {
 			return fmt.Errorf("invalid SignupDefaultCustomClaims JSON: %w", err)
 		}
 		if len(claims) > 0 {
-			if _, err := s.customClaimService.updateCustomClaimsInternal(ctx, UserID, user.ID, claims, tx); err != nil {
+			_, err = s.customClaimService.updateCustomClaimsInternal(ctx, UserID, user.ID, claims, tx)
+			if err != nil {
 				return fmt.Errorf("failed to apply default custom claims: %w", err)
 			}
 		}
@@ -345,6 +393,7 @@ func (s *UserService) updateUserInternal(ctx context.Context, userID string, upd
 	err := tx.
 		WithContext(ctx).
 		Where("id = ?", userID).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
 		First(&user).
 		Error
 	if err != nil {
@@ -405,30 +454,36 @@ func (s *UserService) RequestOneTimeAccessEmailAsAdmin(ctx context.Context, user
 		return &common.OneTimeAccessDisabledError{}
 	}
 
-	return s.requestOneTimeAccessEmailInternal(ctx, userID, "", ttl)
+	_, err := s.requestOneTimeAccessEmailInternal(ctx, userID, "", ttl, true)
+	return err
 }
 
-func (s *UserService) RequestOneTimeAccessEmailAsUnauthenticatedUser(ctx context.Context, userID, redirectPath string) error {
+func (s *UserService) RequestOneTimeAccessEmailAsUnauthenticatedUser(ctx context.Context, userID, redirectPath string) (string, error) {
 	isDisabled := !s.appConfigService.GetDbConfig().EmailOneTimeAccessAsUnauthenticatedEnabled.IsTrue()
 	if isDisabled {
-		return &common.OneTimeAccessDisabledError{}
+		return "", &common.OneTimeAccessDisabledError{}
 	}
 
 	var userId string
 	err := s.db.Model(&model.User{}).Select("id").Where("email = ?", userID).First(&userId).Error
-	if err != nil {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		// Do not return error if user not found to prevent email enumeration
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil
-		} else {
-			return err
-		}
+		return "", nil
+	} else if err != nil {
+		return "", err
 	}
 
-	return s.requestOneTimeAccessEmailInternal(ctx, userId, redirectPath, 15*time.Minute)
+	deviceToken, err := s.requestOneTimeAccessEmailInternal(ctx, userId, redirectPath, 15*time.Minute, true)
+	if err != nil {
+		return "", err
+	} else if deviceToken == nil {
+		return "", errors.New("device token expected but not returned")
+	}
+
+	return *deviceToken, nil
 }
 
-func (s *UserService) requestOneTimeAccessEmailInternal(ctx context.Context, userID, redirectPath string, ttl time.Duration) error {
+func (s *UserService) requestOneTimeAccessEmailInternal(ctx context.Context, userID, redirectPath string, ttl time.Duration, withDeviceToken bool) (*string, error) {
 	tx := s.db.Begin()
 	defer func() {
 		tx.Rollback()
@@ -436,21 +491,20 @@ func (s *UserService) requestOneTimeAccessEmailInternal(ctx context.Context, use
 
 	user, err := s.GetUser(ctx, userID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if user.Email == nil {
-		return &common.UserEmailNotSetError{}
+		return nil, &common.UserEmailNotSetError{}
 	}
 
-	oneTimeAccessToken, err := s.createOneTimeAccessTokenInternal(ctx, user.ID, ttl, tx)
+	oneTimeAccessToken, deviceToken, err := s.createOneTimeAccessTokenInternal(ctx, user.ID, ttl, withDeviceToken, tx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
 	err = tx.Commit().Error
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// We use a background context here as this is running in a goroutine
@@ -483,28 +537,29 @@ func (s *UserService) requestOneTimeAccessEmailInternal(ctx context.Context, use
 		}
 	}()
 
-	return nil
+	return deviceToken, nil
 }
 
-func (s *UserService) CreateOneTimeAccessToken(ctx context.Context, userID string, ttl time.Duration) (string, error) {
-	return s.createOneTimeAccessTokenInternal(ctx, userID, ttl, s.db)
+func (s *UserService) CreateOneTimeAccessToken(ctx context.Context, userID string, ttl time.Duration) (token string, err error) {
+	token, _, err = s.createOneTimeAccessTokenInternal(ctx, userID, ttl, false, s.db)
+	return token, err
 }
 
-func (s *UserService) createOneTimeAccessTokenInternal(ctx context.Context, userID string, ttl time.Duration, tx *gorm.DB) (string, error) {
-	oneTimeAccessToken, err := NewOneTimeAccessToken(userID, ttl)
+func (s *UserService) createOneTimeAccessTokenInternal(ctx context.Context, userID string, ttl time.Duration, withDeviceToken bool, tx *gorm.DB) (token string, deviceToken *string, err error) {
+	oneTimeAccessToken, err := NewOneTimeAccessToken(userID, ttl, withDeviceToken)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	err = tx.WithContext(ctx).Create(oneTimeAccessToken).Error
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
-	return oneTimeAccessToken.Token, nil
+	return oneTimeAccessToken.Token, oneTimeAccessToken.DeviceToken, nil
 }
 
-func (s *UserService) ExchangeOneTimeAccessToken(ctx context.Context, token string, ipAddress, userAgent string) (model.User, string, error) {
+func (s *UserService) ExchangeOneTimeAccessToken(ctx context.Context, token, deviceToken, ipAddress, userAgent string) (model.User, string, error) {
 	tx := s.db.Begin()
 	defer func() {
 		tx.Rollback()
@@ -513,7 +568,9 @@ func (s *UserService) ExchangeOneTimeAccessToken(ctx context.Context, token stri
 	var oneTimeAccessToken model.OneTimeAccessToken
 	err := tx.
 		WithContext(ctx).
-		Where("token = ? AND expires_at > ?", token, datatype.DateTime(time.Now())).Preload("User").
+		Where("token = ? AND expires_at > ?", token, datatype.DateTime(time.Now())).
+		Preload("User").
+		Clauses(clause.Locking{Strength: "UPDATE"}).
 		First(&oneTimeAccessToken).
 		Error
 	if err != nil {
@@ -522,6 +579,10 @@ func (s *UserService) ExchangeOneTimeAccessToken(ctx context.Context, token stri
 		}
 		return model.User{}, "", err
 	}
+	if oneTimeAccessToken.DeviceToken != nil && deviceToken != *oneTimeAccessToken.DeviceToken {
+		return model.User{}, "", &common.DeviceCodeInvalid{}
+	}
+
 	accessToken, err := s.jwtService.GenerateAccessToken(oneTimeAccessToken.User)
 	if err != nil {
 		return model.User{}, "", err
@@ -679,7 +740,7 @@ func (s *UserService) ResetProfilePicture(ctx context.Context, userID string) er
 	return nil
 }
 
-func (s *UserService) disableUserInternal(ctx context.Context, userID string, tx *gorm.DB) error {
+func (s *UserService) disableUserInternal(ctx context.Context, tx *gorm.DB, userID string) error {
 	return tx.
 		WithContext(ctx).
 		Model(&model.User{}).
@@ -688,11 +749,21 @@ func (s *UserService) disableUserInternal(ctx context.Context, userID string, tx
 		Error
 }
 
-func (s *UserService) CreateSignupToken(ctx context.Context, ttl time.Duration, usageLimit int) (model.SignupToken, error) {
+func (s *UserService) CreateSignupToken(ctx context.Context, ttl time.Duration, usageLimit int, userGroupIDs []string) (model.SignupToken, error) {
 	signupToken, err := NewSignupToken(ttl, usageLimit)
 	if err != nil {
 		return model.SignupToken{}, err
 	}
+
+	var userGroups []model.UserGroup
+	err = s.db.WithContext(ctx).
+		Where("id IN ?", userGroupIDs).
+		Find(&userGroups).
+		Error
+	if err != nil {
+		return model.SignupToken{}, err
+	}
+	signupToken.UserGroups = userGroups
 
 	err = s.db.WithContext(ctx).Create(signupToken).Error
 	if err != nil {
@@ -716,10 +787,13 @@ func (s *UserService) SignUp(ctx context.Context, signupData dto.SignUpDto, ipAd
 	}
 
 	var signupToken model.SignupToken
+	var userGroupIDs []string
 	if tokenProvided {
 		err := tx.
 			WithContext(ctx).
+			Preload("UserGroups").
 			Where("token = ?", signupData.Token).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
 			First(&signupToken).
 			Error
 		if err != nil {
@@ -732,14 +806,19 @@ func (s *UserService) SignUp(ctx context.Context, signupData dto.SignUpDto, ipAd
 		if !signupToken.IsValid() {
 			return model.User{}, "", &common.TokenInvalidOrExpiredError{}
 		}
+
+		for _, group := range signupToken.UserGroups {
+			userGroupIDs = append(userGroupIDs, group.ID)
+		}
 	}
 
 	userToCreate := dto.UserCreateDto{
-		Username:    signupData.Username,
-		Email:       signupData.Email,
-		FirstName:   signupData.FirstName,
-		LastName:    signupData.LastName,
-		DisplayName: strings.TrimSpace(signupData.FirstName + " " + signupData.LastName),
+		Username:     signupData.Username,
+		Email:        signupData.Email,
+		FirstName:    signupData.FirstName,
+		LastName:     signupData.LastName,
+		DisplayName:  strings.TrimSpace(signupData.FirstName + " " + signupData.LastName),
+		UserGroupIds: userGroupIDs,
 	}
 
 	user, err := s.createUserInternal(ctx, userToCreate, false, tx)
@@ -780,7 +859,7 @@ func (s *UserService) SignUp(ctx context.Context, signupData dto.SignUpDto, ipAd
 
 func (s *UserService) ListSignupTokens(ctx context.Context, listRequestOptions utils.ListRequestOptions) ([]model.SignupToken, utils.PaginationResponse, error) {
 	var tokens []model.SignupToken
-	query := s.db.WithContext(ctx).Model(&model.SignupToken{})
+	query := s.db.WithContext(ctx).Preload("UserGroups").Model(&model.SignupToken{})
 
 	pagination, err := utils.PaginateFilterAndSort(listRequestOptions, query, &tokens)
 	return tokens, pagination, err
@@ -790,23 +869,33 @@ func (s *UserService) DeleteSignupToken(ctx context.Context, tokenID string) err
 	return s.db.WithContext(ctx).Delete(&model.SignupToken{}, "id = ?", tokenID).Error
 }
 
-func NewOneTimeAccessToken(userID string, ttl time.Duration) (*model.OneTimeAccessToken, error) {
+func NewOneTimeAccessToken(userID string, ttl time.Duration, withDeviceToken bool) (*model.OneTimeAccessToken, error) {
 	// If expires at is less than 15 minutes, use a 6-character token instead of 16
 	tokenLength := 16
 	if ttl <= 15*time.Minute {
 		tokenLength = 6
 	}
 
-	randomString, err := utils.GenerateRandomAlphanumericString(tokenLength)
+	token, err := utils.GenerateRandomAlphanumericString(tokenLength)
 	if err != nil {
 		return nil, err
 	}
 
+	var deviceToken *string
+	if withDeviceToken {
+		dt, err := utils.GenerateRandomAlphanumericString(16)
+		if err != nil {
+			return nil, err
+		}
+		deviceToken = &dt
+	}
+
 	now := time.Now().Round(time.Second)
 	o := &model.OneTimeAccessToken{
-		UserID:    userID,
-		ExpiresAt: datatype.DateTime(now.Add(ttl)),
-		Token:     randomString,
+		UserID:      userID,
+		ExpiresAt:   datatype.DateTime(now.Add(ttl)),
+		Token:       token,
+		DeviceToken: deviceToken,
 	}
 
 	return o, nil

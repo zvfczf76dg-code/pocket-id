@@ -22,39 +22,42 @@ func Bootstrap(ctx context.Context) error {
 	}
 	slog.InfoContext(ctx, "Pocket ID is starting")
 
+	// Connect to the database
+	db, err := NewDatabase()
+	if err != nil {
+		return fmt.Errorf("failed to initialize database: %w", err)
+	}
+
 	// Initialize the file storage backend
 	var fileStorage storage.FileStorage
 
 	switch common.EnvConfig.FileBackend {
 	case storage.TypeFileSystem:
 		fileStorage, err = storage.NewFilesystemStorage(common.EnvConfig.UploadPath)
+	case storage.TypeDatabase:
+		fileStorage, err = storage.NewDatabaseStorage(db)
 	case storage.TypeS3:
 		s3Cfg := storage.S3Config{
-			Bucket:          common.EnvConfig.S3Bucket,
-			Region:          common.EnvConfig.S3Region,
-			Endpoint:        common.EnvConfig.S3Endpoint,
-			AccessKeyID:     common.EnvConfig.S3AccessKeyID,
-			SecretAccessKey: common.EnvConfig.S3SecretAccessKey,
-			ForcePathStyle:  common.EnvConfig.S3ForcePathStyle,
-			Root:            common.EnvConfig.UploadPath,
+			Bucket:                        common.EnvConfig.S3Bucket,
+			Region:                        common.EnvConfig.S3Region,
+			Endpoint:                      common.EnvConfig.S3Endpoint,
+			AccessKeyID:                   common.EnvConfig.S3AccessKeyID,
+			SecretAccessKey:               common.EnvConfig.S3SecretAccessKey,
+			ForcePathStyle:                common.EnvConfig.S3ForcePathStyle,
+			DisableDefaultIntegrityChecks: common.EnvConfig.S3DisableDefaultIntegrityChecks,
+			Root:                          common.EnvConfig.UploadPath,
 		}
 		fileStorage, err = storage.NewS3Storage(ctx, s3Cfg)
 	default:
 		err = fmt.Errorf("unknown file storage backend: %s", common.EnvConfig.FileBackend)
 	}
 	if err != nil {
-		return fmt.Errorf("failed to initialize file storage: %w", err)
+		return fmt.Errorf("failed to initialize file storage (backend: %s): %w", common.EnvConfig.FileBackend, err)
 	}
 
 	imageExtensions, err := initApplicationImages(ctx, fileStorage)
 	if err != nil {
 		return fmt.Errorf("failed to initialize application images: %w", err)
-	}
-
-	// Connect to the database
-	db, err := NewDatabase()
-	if err != nil {
-		return fmt.Errorf("failed to initialize database: %w", err)
 	}
 
 	// Create all services

@@ -187,12 +187,47 @@ func TestParseEnvConfig(t *testing.T) {
 		assert.False(t, EnvConfig.AnalyticsDisabled)
 	})
 
+	t.Run("should default audit log retention days to 90", func(t *testing.T) {
+		EnvConfig = defaultConfig()
+		t.Setenv("DB_PROVIDER", "sqlite")
+		t.Setenv("DB_CONNECTION_STRING", "file:test.db")
+		t.Setenv("APP_URL", "http://localhost:3000")
+
+		err := parseEnvConfig()
+		require.NoError(t, err)
+		assert.Equal(t, 90, EnvConfig.AuditLogRetentionDays)
+	})
+
+	t.Run("should parse audit log retention days override", func(t *testing.T) {
+		EnvConfig = defaultConfig()
+		t.Setenv("DB_PROVIDER", "sqlite")
+		t.Setenv("DB_CONNECTION_STRING", "file:test.db")
+		t.Setenv("APP_URL", "http://localhost:3000")
+		t.Setenv("AUDIT_LOG_RETENTION_DAYS", "365")
+
+		err := parseEnvConfig()
+		require.NoError(t, err)
+		assert.Equal(t, 365, EnvConfig.AuditLogRetentionDays)
+	})
+
+	t.Run("should fail when AUDIT_LOG_RETENTION_DAYS is non-positive", func(t *testing.T) {
+		EnvConfig = defaultConfig()
+		t.Setenv("DB_PROVIDER", "sqlite")
+		t.Setenv("DB_CONNECTION_STRING", "file:test.db")
+		t.Setenv("APP_URL", "http://localhost:3000")
+		t.Setenv("AUDIT_LOG_RETENTION_DAYS", "0")
+
+		err := parseEnvConfig()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "AUDIT_LOG_RETENTION_DAYS must be greater than 0")
+	})
+
 	t.Run("should parse string environment variables correctly", func(t *testing.T) {
 		EnvConfig = defaultConfig()
 		t.Setenv("DB_PROVIDER", "postgres")
 		t.Setenv("DB_CONNECTION_STRING", "postgres://test")
 		t.Setenv("APP_URL", "https://prod.example.com")
-		t.Setenv("APP_ENV", "STAGING")
+		t.Setenv("APP_ENV", "PRODUCTION")
 		t.Setenv("UPLOAD_PATH", "/custom/uploads")
 		t.Setenv("KEYS_PATH", "/custom/keys")
 		t.Setenv("PORT", "8080")
@@ -203,7 +238,7 @@ func TestParseEnvConfig(t *testing.T) {
 
 		err := parseEnvConfig()
 		require.NoError(t, err)
-		assert.Equal(t, "staging", EnvConfig.AppEnv) // lowercased
+		assert.Equal(t, AppEnvProduction, EnvConfig.AppEnv) // lowercased
 		assert.Equal(t, "/custom/uploads", EnvConfig.UploadPath)
 		assert.Equal(t, "8080", EnvConfig.Port)
 		assert.Equal(t, "localhost", EnvConfig.Host) // lowercased
@@ -214,12 +249,12 @@ func TestParseEnvConfig(t *testing.T) {
 		t.Setenv("DB_PROVIDER", "sqlite")
 		t.Setenv("DB_CONNECTION_STRING", "file:test.db")
 		t.Setenv("APP_URL", "http://localhost:3000")
-		t.Setenv("FILE_BACKEND", "FS")
+		t.Setenv("FILE_BACKEND", "FILESYSTEM")
 		t.Setenv("UPLOAD_PATH", "")
 
 		err := parseEnvConfig()
 		require.NoError(t, err)
-		assert.Equal(t, "fs", EnvConfig.FileBackend)
+		assert.Equal(t, "filesystem", EnvConfig.FileBackend)
 		assert.Equal(t, defaultFsUploadPath, EnvConfig.UploadPath)
 	})
 
@@ -279,7 +314,7 @@ func TestPrepareEnvConfig_FileBasedAndToLower(t *testing.T) {
 		err := prepareEnvConfig(&config)
 		require.NoError(t, err)
 
-		assert.Equal(t, "staging", config.AppEnv)
+		assert.Equal(t, AppEnv("staging"), config.AppEnv)
 		assert.Equal(t, "localhost", config.Host)
 		assert.Equal(t, []byte(encryptionKeyContent), config.EncryptionKey)
 		assert.Equal(t, dbConnContent, config.DbConnectionString)

@@ -20,11 +20,20 @@ export const cachedApplicationLogo: CachableImage = {
 	}
 };
 
+export const cachedEmailLogo: CachableImage = {
+	getUrl: () => getCachedImageUrl(new URL('/api/application-images/email', window.location.origin)),
+	bustCache: () => bustImageCache(new URL('/api/application-images/email', window.location.origin))
+};
+
 export const cachedDefaultProfilePicture: CachableImage = {
 	getUrl: () =>
-		getCachedImageUrl(new URL('/api/application-images/default-profile-picture', window.location.origin)),
+		getCachedImageUrl(
+			new URL('/api/application-images/default-profile-picture', window.location.origin)
+		),
 	bustCache: () =>
-		bustImageCache(new URL('/api/application-images/default-profile-picture', window.location.origin))
+		bustImageCache(
+			new URL('/api/application-images/default-profile-picture', window.location.origin)
+		)
 };
 
 export const cachedBackgroundImage: CachableImage = {

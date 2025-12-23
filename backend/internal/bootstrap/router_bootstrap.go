@@ -41,11 +41,11 @@ func initRouter(db *gorm.DB, svc *services) utils.Service {
 func initRouterInternal(db *gorm.DB, svc *services) (utils.Service, error) {
 	// Set the appropriate Gin mode based on the environment
 	switch common.EnvConfig.AppEnv {
-	case "production":
+	case common.AppEnvProduction:
 		gin.SetMode(gin.ReleaseMode)
-	case "development":
+	case common.AppEnvDevelopment:
 		gin.SetMode(gin.DebugMode)
-	case "test":
+	case common.AppEnvTest:
 		gin.SetMode(gin.TestMode)
 	}
 
@@ -63,6 +63,8 @@ func initRouterInternal(db *gorm.DB, svc *services) (utils.Service, error) {
 	rateLimitMiddleware := middleware.NewRateLimitMiddleware().Add(rate.Every(time.Second), 60)
 
 	// Setup global middleware
+	r.Use(middleware.HeadMiddleware())
+	r.Use(middleware.NewCacheControlMiddleware().Add())
 	r.Use(middleware.NewCorsMiddleware().Add())
 	r.Use(middleware.NewCspMiddleware().Add())
 	r.Use(middleware.NewErrorHandlerMiddleware().Add())
@@ -92,7 +94,7 @@ func initRouterInternal(db *gorm.DB, svc *services) (utils.Service, error) {
 	controller.NewVersionController(apiGroup, svc.versionService)
 
 	// Add test controller in non-production environments
-	if common.EnvConfig.AppEnv != "production" {
+	if !common.EnvConfig.AppEnv.IsProduction() {
 		for _, f := range registerTestControllers {
 			f(apiGroup, db, svc)
 		}
@@ -110,7 +112,17 @@ func initRouterInternal(db *gorm.DB, svc *services) (utils.Service, error) {
 	srv := &http.Server{
 		MaxHeaderBytes:    1 << 20,
 		ReadHeaderTimeout: 10 * time.Second,
-		Handler:           r,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			// HEAD requests don't get matched by Gin routes, so we convert them to GET
+			// middleware.HeadMiddleware will convert them back to HEAD later
+			if req.Method == http.MethodHead {
+				req.Method = http.MethodGet
+				ctx := context.WithValue(req.Context(), middleware.IsHeadRequestCtxKey{}, true)
+				req = req.WithContext(ctx)
+			}
+
+			r.ServeHTTP(w, req)
+		}),
 	}
 
 	// Set up the listener
@@ -186,6 +198,7 @@ func initLogger(r *gin.Engine) {
 		"GET /api/application-images/logo",
 		"GET /api/application-images/background",
 		"GET /api/application-images/favicon",
+		"GET /api/application-images/email",
 		"GET /_app",
 		"GET /fonts",
 		"GET /healthz",

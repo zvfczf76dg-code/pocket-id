@@ -344,6 +344,9 @@ func (s *TestService) SeedDatabase(baseURL string) error {
 				ExpiresAt:  datatype.DateTime(time.Now().Add(24 * time.Hour)),
 				UsageLimit: 1,
 				UsageCount: 0,
+				UserGroups: []model.UserGroup{
+					userGroups[0],
+				},
 			},
 			{
 				Base: model.Base{
@@ -426,7 +429,8 @@ func (s *TestService) ResetDatabase() error {
 }
 
 func (s *TestService) ResetApplicationImages(ctx context.Context) error {
-	if err := s.fileStorage.DeleteAll(ctx, "/"); err != nil {
+	err := s.fileStorage.DeleteAll(ctx, "/")
+	if err != nil {
 		slog.ErrorContext(ctx, "Error removing uploads", slog.Any("error", err))
 		return err
 	}
@@ -445,7 +449,8 @@ func (s *TestService) ResetApplicationImages(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := s.fileStorage.Save(ctx, path.Join("application-images", file.Name()), srcFile); err != nil {
+		err = s.fileStorage.Save(ctx, path.Join("application-images", file.Name()), srcFile)
+		if err != nil {
 			srcFile.Close()
 			return err
 		}
